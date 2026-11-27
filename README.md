@@ -50,7 +50,7 @@
 ## Install
 
 ### macOS
-1. Download `AssignmentManager-macOS.zip` from [Releases](../../releases), unzip it, and drag **Assignment Manager.app** to **Applications**.
+1. Download [`AssignmentManager-macOS.zip`](downloads/AssignmentManager-macOS.zip), unzip it, and drag **Assignment Manager.app** to **Applications**.
 2. The first time only, right-click the app and choose **Open**. If macOS still blocks it, go to **System Settings → Privacy & Security → Open Anyway**. Alternatively, run:
    `xattr -dr com.apple.quarantine "/Applications/Assignment Manager.app"`
 3. On first launch the app installs its native-window component (`pywebview`) into `~/.assignment_manager/venv`, which takes about a minute. After that it opens instantly.
@@ -58,6 +58,7 @@
 You need Python 3.9+ from [python.org](https://www.python.org/downloads/macos/).
 
 ### Windows / Linux / from source
+Download the single file [`downloads/assignment_manager.py`](downloads/assignment_manager.py) and run `python3 assignment_manager.py`, or run it from source:
 ```bash
 git clone https://github.com/Sunit127/assignment-manager.git
 cd assignment-manager
@@ -66,7 +67,7 @@ python3 app/assignment_manager.py
 The app opens in a native window (pywebview is installed automatically on first run). If that isn't possible, it falls back to a Chrome or Edge app window.
 
 ### Claude extension (optional)
-Double-click `assignment-manager.mcpb` (from Releases, or run `python3 scripts/build.py`) to install it in the Claude desktop app. It gives Claude seven tools:
+Download [`assignment-manager.mcpb`](downloads/assignment-manager.mcpb) and double-click it to install it in the Claude desktop app. It gives Claude seven tools:
 - `get_summary`
 - `get_upcoming_deadlines`
 - `list_assignments`
@@ -86,6 +87,7 @@ claude-extension/
   server/main.py          # Zero-dependency MCP server over the same database
 scripts/build.py          # Builds the single-file app, macOS .app, and .mcpb
 docs/                     # Screenshots and icon (fictional demo data)
+downloads/                # Ready-to-use builds: macOS app, single file, Claude extension
 ```
 
 ## Build
