@@ -696,7 +696,7 @@ def ensure_webview():
     win = sys.platform.startswith("win")
     venv = os.path.join(DATA_DIR, "venv")
     vpy = os.path.join(venv, "Scripts", "python.exe") if win else os.path.join(venv, "bin", "python")
-    if os.path.realpath(sys.executable) == os.path.realpath(vpy) or os.environ.get("AM_IN_VENV"):
+    if os.path.realpath(sys.prefix) == os.path.realpath(venv) or os.environ.get("AM_IN_VENV"):
         return False  # already inside the venv and it still failed
     marker = os.path.join(DATA_DIR, "webview_failed")
     if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 86400:
