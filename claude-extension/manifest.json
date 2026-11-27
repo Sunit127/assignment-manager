@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "assignment-manager",
   "display_name": "Assignment Manager",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Let Claude read and manage your client assignments, IDs and deadlines from the Assignment Manager desktop app.",
   "long_description": "Connects Claude to the Assignment Manager desktop app's local database (~/.assignment_manager/assignments.db). Ask Claude what's due, add or update assignments, change status or payment, and get deadline summaries. Changes appear in the desktop app within a minute.",
   "author": { "name": "Sunit Sah" },

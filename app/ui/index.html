@@ -374,6 +374,11 @@ body[data-mode="light"] .toast{background:rgba(255,255,255,.96)}
 @keyframes life{from{width:100%}to{width:0}}
 #confetti{position:fixed;inset:0;pointer-events:none;z-index:70}
 
+.sync-pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);cursor:pointer;margin-top:2px}
+.sync-pill i{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.sync-pill.ok i{background:var(--done);box-shadow:0 0 0 3px color-mix(in srgb,var(--done) 25%,transparent)}
+.sync-pill.syncing i{background:var(--accent2);animation:pulse 1s infinite}
+.sync-pill.error i{background:var(--overdue)}
 .empty{text-align:center;padding:60px 20px;color:var(--muted)}
 .empty .big{font-size:56px;margin-bottom:10px;animation:float 4s ease-in-out infinite}
 @keyframes float{50%{transform:translateY(-10px)}}
@@ -392,7 +397,7 @@ body[data-mode="light"] .toast{background:rgba(255,255,255,.96)}
 
 <div class="app">
   <aside class="sidebar glass">
-    <div class="brand"><div class="logo">✦</div><div><b>Assignment Manager</b><small id="ver">Client deadlines, beautifully</small></div></div>
+    <div class="brand"><div class="logo">✦</div><div><b>Assignment Manager</b><small id="ver">Client deadlines, beautifully</small><div class="sync-pill" id="sync-pill" title="iPhone sync"><i></i><span>Sync off</span></div></div></div>
     <nav class="nav" id="nav"></nav>
     <div class="side-label"><span>Clients</span><span id="client-count"></span></div>
     <div class="search"><input id="client-search" placeholder="Search clients…" autocomplete="off"></div>
@@ -440,7 +445,7 @@ async function api(path, method = "GET", body) {
 async function load(force) {
   const st = await api("/api/state");
   const changed = force || st.signature !== S.sig;
-  S.rows = st.assignments; S.settings = st.settings; S.meta = st.meta; S.sig = st.signature;
+  S.rows = st.assignments; S.settings = st.settings; S.meta = st.meta; S.sig = st.signature; S.sync = st.sync || {}; renderSync();
   $("#ver").textContent = "Version " + st.version;
   for (const e of st.events || []) {
     if (e.t > S.lastEvent) {
@@ -453,6 +458,12 @@ async function load(force) {
   if (S.first) { S.first = false; setTimeout(() => { $("#loader").style.opacity = 0; setTimeout(() => $("#loader").remove(), 600); }, 250); startupSummary(); }
 }
 
+function renderSync() {
+  const p = $("#sync-pill"); if (!p) return; const st = (S.sync || {}).state || "off";
+  p.className = "sync-pill " + st;
+  p.querySelector("span").textContent = st === "ok" ? "Synced with iPhone" : st === "syncing" ? "Syncing…" : st === "error" ? "Sync problem" : "iPhone sync off";
+  p.title = (S.sync && S.sync.error) || (S.sync && S.sync.last ? "Last sync " + S.sync.last : "Set up in Settings");
+}
 /* ------------------------------------------------------------------ dates */
 function pd(s) {
   if (!s) return null;
@@ -869,6 +880,11 @@ function openSettings() {
       <div><label>Remind me before deadline (days)</label><input class="input" id="s-days" type="number" min="1" max="30" value="${esc(S.settings.soon_days || 3)}"></div>
       <div class="full row" style="justify-content:space-between"><div><b>Desktop notifications</b><div style="color:var(--muted);font-size:13px">3 days, 24 hours and 1 hour before, and when overdue</div></div>
         <div class="row"><button class="btn sm" id="s-test">Test</button><div class="switch ${S.settings.notifications !== "0" ? "on" : ""}" id="s-notif"></div></div></div>
+      <div class="full" style="border-top:1px solid var(--border);padding-top:16px"><b>📱 Sync with iPhone (via GitHub)</b>
+        <div style="color:var(--muted);font-size:13px;margin:4px 0 12px">Your assignments are stored in a private GitHub repo and synced with the iPhone app. ${S.sync && S.sync.state === "ok" ? `<span style="color:var(--done)">● Synced ${esc(S.sync.last || "")}</span>` : S.sync && S.sync.state === "error" ? `<span style="color:var(--overdue)">● ${esc(S.sync.error || "")}</span>` : ""}</div></div>
+      <div><label>Data repository (owner/name)</label><input class="input" id="s-repo" value="${esc(S.settings.gh_repo || "")}" placeholder="Sunit127/assignment-data"></div>
+      <div><label>GitHub token ${S.settings.gh_token_set ? "(saved ✓)" : ""}</label><input class="input" id="s-token" type="password" placeholder="${S.settings.gh_token_set ? "•••••••• (leave blank to keep)" : "github_pat_…"}" autocomplete="off"></div>
+      <div class="full row" style="justify-content:flex-end;gap:8px"><button class="btn sm" id="s-disconnect">Disconnect</button><button class="btn sm primary" id="s-sync">⟳ Save & sync now</button></div>
       <div class="full row" style="justify-content:space-between"><div><b>Export</b><div style="color:var(--muted);font-size:13px">Save all assignments as a CSV in Downloads</div></div><button class="btn sm" id="s-export">⤓ Export CSV</button></div>
     </div>
     <div class="modal-actions"><button class="btn primary" data-x>Done</button></div></div>`,
@@ -879,6 +895,9 @@ function openSettings() {
     $("#s-notif", wrap).onclick = async e => { const on = !e.currentTarget.classList.contains("on"); e.currentTarget.classList.toggle("on", on); await saveSettings({notifications:on ? "1" : "0"}); };
     $("#s-test", wrap).onclick = async () => { await api("/api/test-notification", "POST"); toast("Test sent", "Check the top-right corner of your screen.", "normal", "🔔"); };
     $("#s-export", wrap).onclick = exportCsv;
+    $("#s-sync", wrap).onclick = async () => { const patch = {gh_repo:$("#s-repo", wrap).value.trim()}; const t = $("#s-token", wrap).value.trim(); if (t) patch.gh_token = t;
+      await saveSettings(patch); await api("/api/sync", "POST"); toast("Syncing…", "Connecting to " + patch.gh_repo, "normal", "⟳"); setTimeout(() => load(true), 2500); setTimeout(() => { load(true); }, 6000); };
+    $("#s-disconnect", wrap).onclick = async () => { await saveSettings({gh_token:"", gh_repo:""}); toast("Disconnected", "iPhone sync is off on this Mac", "soon", "⏻"); close(); };
   });
 }
 async function exportCsv() { try { const r = await api("/api/export", "POST"); toast("Exported", r.path, "done", "⤓"); } catch (e) { toast("Export failed", e.message, "overdue", "!"); } }
@@ -941,6 +960,7 @@ $("#btn-new").onclick = () => openForm();
 $("#btn-settings").onclick = openSettings;
 $("#btn-palette").onclick = openPalette;
 $("#btn-mode").onclick = toggleMode;
+$("#sync-pill").onclick = openSettings;
 $("#scrim").onclick = closeDrawer;
 $("#client-search").oninput = renderClients;
 document.addEventListener("keydown", e => {

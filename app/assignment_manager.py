@@ -16,11 +16,16 @@ Run:  python3 assignment_manager.py            (opens the app window)
       python3 assignment_manager.py --server   (API + UI only, prints the URL)
 """
 
+import base64
 import csv
 import hashlib
 import json
 import os
 import secrets
+import ssl
+import urllib.error
+import urllib.request
+import uuid
 import shutil
 import sqlite3
 import subprocess
@@ -33,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "Assignment Manager"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 DATE_FMT = "%Y-%m-%d %H:%M"
 DAY_FMT = "%Y-%m-%d"
 DATA_DIR = os.environ.get("ASSIGNMENT_DATA_DIR") or os.path.join(
@@ -50,7 +55,9 @@ FIELDS = ["title", "client", "client_contact", "subject", "module_code", "word_c
           "assigned_date", "deadline", "priority", "status", "amount", "payment_status",
           "description", "notes"]
 DEFAULT_SETTINGS = {"soon_days": "3", "theme": "aurora", "mode": "dark", "owner": "",
-                    "notifications": "1"}
+                    "notifications": "1", "gh_token": "", "gh_repo": ""}
+SYNC_FIELDS = ["code"] + FIELDS + ["created_at", "updated_at"]
+SYNC_FILE = "assignments.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +79,14 @@ class Database:
                 priority TEXT, status TEXT, amount TEXT, payment_status TEXT, notes TEXT,
                 notified TEXT DEFAULT '', created_at TEXT, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS tombstones (uid TEXT PRIMARY KEY, deleted_ms INTEGER);
+            CREATE TABLE IF NOT EXISTS sync_state (uid TEXT PRIMARY KEY, hash TEXT);
             """)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(assignments)")}
+        if "uid" not in cols:
+            self.conn.execute("ALTER TABLE assignments ADD COLUMN uid TEXT")
+        if "mtime" not in cols:
+            self.conn.execute("ALTER TABLE assignments ADD COLUMN mtime INTEGER DEFAULT 0")
         self.conn.commit()
 
     # settings
@@ -102,6 +116,17 @@ class Database:
             r = self.conn.execute("SELECT * FROM assignments WHERE id=?", (row_id,)).fetchone()
             return dict(r) if r else None
 
+    def next_code(self, year=None):
+        year = year or datetime.now().year
+        best = 0
+        for (code,) in self.conn.execute("SELECT code FROM assignments WHERE code LIKE ?",
+                                         (f"ASG-{year}-%",)):
+            try:
+                best = max(best, int(str(code).rsplit("-", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+        return f"ASG-{year}-{best + 1:04d}"
+
     def add(self, data):
         data = validate(data)
         data.setdefault("priority", "Medium")
@@ -114,8 +139,9 @@ class Database:
                 f"INSERT INTO assignments ({','.join(FIELDS)}, created_at, updated_at) "
                 f"VALUES ({','.join('?' * len(FIELDS))}, ?, ?)",
                 [data.get(f, "") for f in FIELDS] + [now, now])
-            code = f"ASG-{datetime.now():%Y}-{cur.lastrowid:04d}"
-            self.conn.execute("UPDATE assignments SET code=? WHERE id=?", (code, cur.lastrowid))
+            code = self.next_code()
+            self.conn.execute("UPDATE assignments SET code=?, uid=? WHERE id=?",
+                              (code, uuid.uuid4().hex, cur.lastrowid))
             self.conn.commit()
             return self.get(cur.lastrowid)
 
@@ -148,6 +174,84 @@ class Database:
             self.conn.execute("UPDATE assignments SET notified=? WHERE id=?",
                               (",".join(sorted(cur)), row_id))
             self.conn.commit()
+
+    # ------------------------------------------------------------ sync
+    @staticmethod
+    def rec_hash(r):
+        return hashlib.sha1(json.dumps([str(r.get(k) or "") for k in SYNC_FIELDS
+                                        if k != "updated_at"]).encode()).hexdigest()
+
+    def prepare_sync(self):
+        """Give every row a uid, stamp locally-changed rows with mtime=now and turn
+        rows deleted since the last sync into tombstones. Returns (records, tombs)."""
+        now = int(time.time() * 1000)
+        with self.lock:
+            rows = self.all()
+            for r in rows:
+                if not r.get("uid"):
+                    r["uid"] = uuid.uuid4().hex
+                    self.conn.execute("UPDATE assignments SET uid=? WHERE id=?", (r["uid"], r["id"]))
+            state = dict(self.conn.execute("SELECT uid, hash FROM sync_state").fetchall())
+            for r in rows:
+                if state.get(r["uid"]) != self.rec_hash(r):
+                    r["mtime"] = max(now, int(r.get("mtime") or 0))
+                    self.conn.execute("UPDATE assignments SET mtime=? WHERE id=?", (r["mtime"], r["id"]))
+            live = {r["uid"] for r in rows}
+            tombs = dict(self.conn.execute("SELECT uid, deleted_ms FROM tombstones").fetchall())
+            for uid in state:
+                if uid not in live and uid not in tombs:
+                    tombs[uid] = now
+                    self.conn.execute("INSERT OR REPLACE INTO tombstones VALUES (?, ?)", (uid, now))
+            self.conn.commit()
+            recs = {}
+            for r in rows:
+                rec = {k: r.get(k) or "" for k in SYNC_FIELDS}
+                rec["uid"], rec["mtime"] = r["uid"], int(r.get("mtime") or 0)
+                recs[r["uid"]] = rec
+            return recs, tombs
+
+    def apply_sync(self, recs, tombs):
+        """Make the local database match the merged result."""
+        changed = False
+        with self.lock:
+            local = {r["uid"]: r for r in self.all() if r.get("uid")}
+            for uid, r in local.items():
+                if uid not in recs:
+                    self.conn.execute("DELETE FROM assignments WHERE id=?", (r["id"],))
+                    changed = True
+            for uid, rec in recs.items():
+                cur = local.get(uid)
+                vals = {k: str(rec.get(k) or "") for k in SYNC_FIELDS}
+                if cur is None:
+                    if self.conn.execute("SELECT 1 FROM assignments WHERE code=?", (vals["code"],)).fetchone() \
+                            or not vals["code"]:
+                        vals["code"] = self.next_code()
+                    cols = list(vals) + ["uid", "mtime", "notified"]
+                    self.conn.execute(
+                        f"INSERT INTO assignments ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                        list(vals.values()) + [uid, int(rec.get("mtime") or 0), ""])
+                    changed = True
+                elif int(rec.get("mtime") or 0) > int(cur.get("mtime") or 0) and \
+                        self.rec_hash(cur) != self.rec_hash(rec):
+                    if vals["code"] != cur["code"] and self.conn.execute(
+                            "SELECT 1 FROM assignments WHERE code=? AND id<>?",
+                            (vals["code"], cur["id"])).fetchone():
+                        vals["code"] = cur["code"]
+                    notified = cur["notified"] if vals["deadline"] == cur["deadline"] else ""
+                    self.conn.execute(
+                        f"UPDATE assignments SET {', '.join(k + '=?' for k in vals)}, mtime=?, notified=? "
+                        f"WHERE id=?", list(vals.values()) + [int(rec["mtime"]), notified, cur["id"]])
+                    changed = True
+            cutoff = int(time.time() * 1000) - 120 * 86400 * 1000
+            self.conn.execute("DELETE FROM tombstones")
+            for uid, ms in tombs.items():
+                if ms >= cutoff:
+                    self.conn.execute("INSERT INTO tombstones VALUES (?, ?)", (uid, int(ms)))
+            self.conn.execute("DELETE FROM sync_state")
+            for r in self.all():
+                self.conn.execute("INSERT INTO sync_state VALUES (?, ?)", (r["uid"], self.rec_hash(r)))
+            self.conn.commit()
+        return changed
 
     def signature(self):
         with self.lock:
@@ -295,12 +399,161 @@ class Reminders(threading.Thread):
 
 
 # --------------------------------------------------------------------------- #
+# GitHub sync (shared with the iPhone app)
+# --------------------------------------------------------------------------- #
+GH_API = os.environ.get("ASSIGNMENT_GH_API", "https://api.github.com")
+
+
+def public_settings(s):
+    out = dict(s)
+    out["gh_token_set"] = bool(out.get("gh_token"))
+    out["gh_token"] = ""
+    return out
+
+
+def merge_docs(L, LT, R, RT):
+    """Last-writer-wins per record (by mtime); tombstones beat older edits.
+    Identical logic lives in the iPhone app."""
+    tombs = {u: max(int(LT.get(u, 0) or 0), int(RT.get(u, 0) or 0)) for u in set(LT) | set(RT)}
+    recs = {}
+    for u in set(L) | set(R):
+        a, b = L.get(u), R.get(u)
+        w = a if (b is None or (a is not None and int(a.get("mtime") or 0) >= int(b.get("mtime") or 0))) else b
+        t = tombs.get(u)
+        if t and t >= int(w.get("mtime") or 0):
+            continue
+        recs[u] = w
+    return recs, tombs
+
+
+def canonical(recs, tombs):
+    return json.dumps({"a": [recs[u] for u in sorted(recs)],
+                       "t": {u: tombs[u] for u in sorted(tombs)}}, sort_keys=True)
+
+
+_SSL = None
+
+
+def ssl_context():
+    global _SSL
+    if _SSL is None:
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except Exception:
+            pass
+        if sys.platform == "darwin":  # python.org builds may lack a CA bundle
+            try:
+                pem = subprocess.run(["security", "find-certificate", "-a", "-p",
+                                      "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                                     capture_output=True, text=True, timeout=20).stdout
+                if pem:
+                    ctx.load_verify_locations(cadata=pem)
+            except Exception:
+                pass
+        _SSL = ctx
+    return _SSL
+
+
+class GitHubSync(threading.Thread):
+    INTERVAL = 30
+
+    def __init__(self, db):
+        super().__init__(daemon=True)
+        self.db = db
+        self.wake = threading.Event()
+        self.lock = threading.Lock()
+        self.status = {"state": "off", "last": None, "error": None, "repo": ""}
+
+    def _req(self, method, url, token, body=None):
+        req = urllib.request.Request(url, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": f"Bearer {token}",
+                                              "Accept": "application/vnd.github+json",
+                                              "X-GitHub-Api-Version": "2022-11-28",
+                                              "User-Agent": "AssignmentManager",
+                                              "Content-Type": "application/json"})
+        ctx = ssl_context() if url.startswith("https") else None
+        with urllib.request.urlopen(req, timeout=25, context=ctx) as r:
+            return json.loads(r.read() or b"{}")
+
+    def sync_once(self):
+        s = self.db.settings()
+        token, repo = s.get("gh_token", "").strip(), s.get("gh_repo", "").strip().strip("/")
+        if not token or not repo:
+            self.status = {"state": "off", "last": None, "error": None, "repo": repo}
+            return
+        url = f"{GH_API}/repos/{repo}/contents/{SYNC_FILE}"
+        with self.lock:
+            self.status.update(state="syncing", repo=repo)
+            for attempt in range(3):
+                try:
+                    local, ltombs = self.db.prepare_sync()
+                    sha, remote, rtombs = None, {}, {}
+                    try:
+                        meta = self._req("GET", url, token)
+                        sha = meta.get("sha")
+                        doc = json.loads(base64.b64decode(meta.get("content", "")).decode("utf-8") or "{}")
+                        remote = {r["uid"]: r for r in doc.get("assignments", []) if r.get("uid")}
+                        rtombs = {t["uid"]: t["deleted_ms"] for t in doc.get("tombstones", [])}
+                    except urllib.error.HTTPError as e:
+                        if e.code != 404:
+                            raise
+                    recs, tombs = merge_docs(local, ltombs, remote, rtombs)
+                    self.db.apply_sync(recs, tombs)
+                    if canonical(recs, tombs) != canonical(remote, rtombs):
+                        doc = {"schema": 1, "app": "assignment-manager",
+                               "updated_ms": int(time.time() * 1000),
+                               "assignments": [recs[u] for u in sorted(recs, key=lambda u: (recs[u].get("deadline", ""), u))],
+                               "tombstones": [{"uid": u, "deleted_ms": tombs[u]} for u in sorted(tombs)]}
+                        body = {"message": f"Sync from desktop ({len(recs)} assignments)",
+                                "content": base64.b64encode(json.dumps(doc, indent=1, ensure_ascii=False)
+                                                            .encode("utf-8")).decode()}
+                        if sha:
+                            body["sha"] = sha
+                        try:
+                            self._req("PUT", url, token, body)
+                        except urllib.error.HTTPError as e:
+                            if e.code in (409, 422) and attempt < 2:
+                                continue  # someone else wrote first: merge again
+                            raise
+                    self.status = {"state": "ok", "error": None, "repo": repo,
+                                   "last": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                    return
+                except urllib.error.HTTPError as e:
+                    msg = {401: "GitHub token is invalid or expired",
+                           403: "Token has no permission for this repository",
+                           404: "Repository not found (check owner/name and token access)"}.get(
+                        e.code, f"GitHub error {e.code}")
+                    self.status = {"state": "error", "error": msg, "repo": repo,
+                                   "last": self.status.get("last")}
+                    return
+                except Exception as e:
+                    self.status = {"state": "error", "error": f"Offline or network error: {e}",
+                                   "repo": repo, "last": self.status.get("last")}
+                    return
+
+    def run(self):
+        time.sleep(1)
+        while True:
+            try:
+                self.sync_once()
+            except Exception as e:
+                self.status = {"state": "error", "error": str(e), "last": self.status.get("last")}
+            self.wake.wait(self.INTERVAL)
+            self.wake.clear()
+            time.sleep(0.8)  # debounce bursts of edits
+
+
+# --------------------------------------------------------------------------- #
 # HTTP API
 # --------------------------------------------------------------------------- #
 class Server:
     def __init__(self, db):
         self.db = db
         self.token = secrets.token_urlsafe(24)
+        self.sync = None
         self.events = []
         self.last_ping = time.time()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -365,7 +618,8 @@ class Server:
                 if path == "/api/state":
                     return self._send(200, {
                         "assignments": server.db.all(),
-                        "settings": server.db.settings(),
+                        "settings": public_settings(server.db.settings()),
+                        "sync": server.sync.status if server.sync else {"state": "off"},
                         "signature": server.db.signature(),
                         "events": server.events[-10:],
                         "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -383,6 +637,12 @@ class Server:
                 parts = [p for p in path.split("/") if p]
                 try:
                     body = self._body()
+                    if parts == ["api", "sync"] and method == "POST":
+                        if server.sync:
+                            server.sync.wake.set()
+                        return self._send(200, {"ok": True})
+                    if server.sync and method in ("POST", "PUT", "DELETE"):
+                        threading.Timer(0.3, server.sync.wake.set).start()
                     if parts == ["api", "assignments"] and method == "POST":
                         return self._send(201, server.db.add(body))
                     if len(parts) == 3 and parts[:2] == ["api", "assignments"]:
@@ -394,7 +654,7 @@ class Server:
                             return self._send(200, {"ok": True})
                     if parts == ["api", "settings"] and method == "PUT":
                         server.db.save_settings(body)
-                        return self._send(200, server.db.settings())
+                        return self._send(200, public_settings(server.db.settings()))
                     if parts == ["api", "export"] and method == "POST":
                         return self._send(200, {"path": server.export_csv()})
                     if parts == ["api", "test-notification"] and method == "POST":
@@ -452,7 +712,7 @@ def ensure_webview():
                 subprocess.run([sys.executable, "-m", "venv", venv], check=True, stdout=log,
                                stderr=log, timeout=300)
             subprocess.run([vpy, "-m", "pip", "install", "--disable-pip-version-check", "-q",
-                            "pywebview"], check=True, stdout=log, stderr=log, timeout=900)
+                            "pywebview", "certifi"], check=True, stdout=log, stderr=log, timeout=900)
         log.close()
         env = dict(os.environ, AM_IN_VENV="1")
         args = [vpy, os.path.abspath(__file__)] + sys.argv[1:]
@@ -503,6 +763,8 @@ def main():
         ensure_webview()  # may re-launch this script inside the private venv
     db = Database()
     server = Server(db)
+    server.sync = GitHubSync(db)
+    server.sync.start()
     server.serve()
     Reminders(db, server.events).start()
 

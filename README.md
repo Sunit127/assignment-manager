@@ -16,7 +16,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-f59e0b">
 </p>
 
-![Dashboard](docs/dashboard.png)
+![Dashboard](docs/screenshots/dashboard.png)
 
 ## Features
 
@@ -34,18 +34,39 @@
 - **Looks the part:** animated aurora backgrounds, frosted-glass panels, staggered entrance animations, count-up numbers, confetti when you complete something, and five colour themes in dark or light mode.
 - **Private by design:** everything is stored locally in SQLite (`~/.assignment_manager/assignments.db`), and the API is bound to `127.0.0.1` with a per-launch token.
 - **Claude extension:** ask Claude "what's due this week?" or "add a module for Priya due Friday 5pm" and it updates the same database.
+- **iPhone app:** the same app on your phone, kept in sync with your Mac through a private GitHub repository (see below).
 
 | Client page | Details drawer |
 |---|---|
-| ![Client](docs/client.png) | ![Details](docs/details.png) |
+| ![Client](docs/screenshots/client.png) | ![Details](docs/screenshots/details.png) |
 
 | Board (drag & drop) | Calendar |
 |---|---|
-| ![Board](docs/board.png) | ![Calendar](docs/calendar.png) |
+| ![Board](docs/screenshots/board.png) | ![Calendar](docs/screenshots/calendar.png) |
 
 | Command palette | Light mode, Sunset theme |
 |---|---|
-| ![Palette](docs/palette.png) | ![Light](docs/light.png) |
+| ![Palette](docs/screenshots/palette.png) | ![Light](docs/screenshots/light.png) |
+
+## 📱 iPhone app
+
+![iPhone](docs/screenshots/iphone.png)
+
+The iPhone app is a web app you add to your Home Screen. It's hosted on GitHub Pages straight from this repo's `docs/` folder, so every push to `main` updates the app on your phone automatically.
+
+**How sync works:** your assignments live in a separate **private** repo (for example `Sunit127/assignment-data`) as one file, `assignments.json`. The Mac app and the iPhone app both pull, merge and push that file:
+- Each record has a stable ID and a timestamp, and the most recent edit wins.
+- Deletions are recorded, so they sync across too.
+
+Changes appear on the other device within about 30 seconds. Sync also runs straight after every edit and whenever you open the app. Edits made while offline are kept and merged later.
+
+**Setup (once):**
+1. Create a private repo named `assignment-data`. It can be empty.
+2. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with access to **only** that repo, and set **Contents** to **Read and write**.
+3. On the Mac, go to **Settings → Sync with iPhone**, then enter the repo and token.
+4. On the iPhone, open `https://sunit127.github.io/assignment-manager/` in Safari, tap **Share → Add to Home Screen**, and enter the same repo and token.
+
+**Reminders on iPhone:** open an assignment and tap **Add to Calendar**. You'll get iOS alerts 1 day and 1 hour before the deadline.
 
 ## Install
 
@@ -86,7 +107,8 @@ claude-extension/
   manifest.json           # Claude Desktop extension manifest (MCPB)
   server/main.py          # Zero-dependency MCP server over the same database
 scripts/build.py          # Builds the single-file app, macOS .app, and .mcpb
-docs/                     # Screenshots and icon (fictional demo data)
+docs/                     # iPhone app (GitHub Pages): index.html, sw.js, manifest, icons
+docs/screenshots/         # Screenshots (fictional demo data)
 downloads/                # Ready-to-use builds: macOS app, single file, Claude extension
 ```
 

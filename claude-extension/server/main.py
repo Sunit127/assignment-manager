@@ -221,7 +221,13 @@ def t_add(args):
             f"INSERT INTO assignments ({','.join(FIELDS)}, created_at, updated_at) "
             f"VALUES ({','.join('?' * len(FIELDS))}, ?, ?)",
             [data.get(f, "") for f in FIELDS] + [now, now])
-        code = f"ASG-{datetime.now():%Y}-{cur.lastrowid:04d}"
+        year, best = datetime.now().year, 0
+        for (c,) in conn.execute("SELECT code FROM assignments WHERE code LIKE ?", (f"ASG-{year}-%",)):
+            try:
+                best = max(best, int(str(c).rsplit("-", 1)[1]))
+            except (ValueError, IndexError):
+                pass
+        code = f"ASG-{year}-{best + 1:04d}"
         conn.execute("UPDATE assignments SET code=? WHERE id=?", (code, cur.lastrowid))
         return {"created": row_dict(find(conn, code))}
 
